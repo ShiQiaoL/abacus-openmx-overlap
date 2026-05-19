@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "abacus-openmx-overlap"
+version = "0.1.0"
+description = "Generate DeepH-format overlap.h5 directly from ABACUS .orb or OpenMX .pao numerical atomic orbitals."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "ShiQiaoL" }
+]
+dependencies = [
+  "numpy",
+  "scipy",
+  "h5py",
+  "deepx-dock==0.9.11",
+  "hpro==0.3.0"
+]
+
+[project.scripts]
+direct-overlap = "direct_overlap.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
