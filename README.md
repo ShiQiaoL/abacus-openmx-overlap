@@ -98,12 +98,35 @@ English: If your downstream DeepH format expects a spinful/spinor matrix, add `-
 direct-overlap DATA_DIR BASIS_DIR \
   --basis-code abacus \
   --output-dir OUT_DIR \
-  --spinful
+  --spinful \
+  --expect-spin spinful
 ```
 
 中文：注意，这不会生成 SOC Hamiltonian，也不会引入 spin-mixing overlap；它只把 spin-independent overlap 写成 spinful matrix 形状。
 
 English: Note that this does not generate an SOC Hamiltonian and does not add spin-mixing overlap terms. It only writes the spin-independent overlap in a spinful matrix shape.
+
+## 推理前检查 / Pre-Inference Check
+
+中文：为了避免 `deeph-infer` 里出现类似 `2704 vs 676` 的 JAX shape 错误，建议在推理前检查 overlap 目录的 spin mode 和 HDF5 block shape。
+
+English: To avoid JAX shape errors such as `2704 vs 676` in `deeph-infer`, check the overlap directory spin mode and HDF5 block shapes before inference.
+
+如果模型是 spinless：
+
+```bash
+direct-overlap-check DFT_OUT_DIR --expect-spin spinless
+```
+
+如果模型是 spinful/spinor：
+
+```bash
+direct-overlap-check DFT_OUT_DIR --expect-spin spinful
+```
+
+中文：`direct-overlap` 生成文件后也会自动做同样的自洽检查，并把结果写入 `direct_overlap_manifest.json`。
+
+English: `direct-overlap` runs the same consistency check after generation and stores the report in `direct_overlap_manifest.json`.
 
 ## 输出 / Outputs
 

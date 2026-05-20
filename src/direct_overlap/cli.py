@@ -475,6 +475,130 @@ def hdf5_summary(path: Path) -> dict[str, Any]:
     }
 
 
+def orbital_count_from_l_list(angular_momenta: list[int]) -> int:
+    return int(sum(2 * int(angular_momentum) + 1 for angular_momentum in angular_momenta))
+
+
+def validate_deeph_overlap_dir(output_dir: Path, expect_spin: str = "any") -> dict[str, Any]:
+    import h5py
+
+    output_dir = normalize_path(output_dir)
+    info_path = output_dir / "info.json"
+    overlap_path = output_dir / "overlap.h5"
+    poscar_path = output_dir / "POSCAR"
+    if not info_path.is_file():
+        raise FileNotFoundError(f"Missing info.json: {info_path}")
+    if not overlap_path.is_file():
+        raise FileNotFoundError(f"Missing overlap.h5: {overlap_path}")
+
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    spinful = bool(info.get("spinful", False))
+    spin_mode = "spinful" if spinful else "spinless"
+    if expect_spin != "any" and spin_mode != expect_spin:
+        raise ValueError(
+            f"Spin mode mismatch: expected {expect_spin}, but {info_path} reports {spin_mode}. "
+            "Regenerate overlap.h5 with or without --spinful to match the trained model."
+        )
+
+    orbital_map = info.get("elements_orbital_map")
+    if not isinstance(orbital_map, dict) or not orbital_map:
+        raise ValueError(f"{info_path} does not contain a valid elements_orbital_map")
+    base_orbitals = {
+        element: orbital_count_from_l_list(angular_momenta)
+        for element, angular_momenta in orbital_map.items()
+    }
+    spin_factor = 2 if spinful else 1
+    expected_dims = {
+        element: count * spin_factor
+        for element, count in base_orbitals.items()
+    }
+
+    with h5py.File(overlap_path, "r") as handle:
+        for dataset in ["atom_pairs", "chunk_boundaries", "chunk_shapes", "entries"]:
+            if dataset not in handle:
+                raise ValueError(f"{overlap_path} is missing required dataset {dataset!r}")
+
+        atom_pairs_shape = tuple(int(item) for item in handle["atom_pairs"].shape)
+        chunk_boundaries = np.asarray(handle["chunk_boundaries"])
+        chunk_shapes = np.asarray(handle["chunk_shapes"])
+        entries_size = int(handle["entries"].shape[0])
+
+    if len(atom_pairs_shape) != 2 or atom_pairs_shape[1] != 5:
+        raise ValueError(f"atom_pairs must have shape (npairs, 5), got {atom_pairs_shape}")
+    if chunk_shapes.ndim != 2 or chunk_shapes.shape[1] != 2:
+        raise ValueError(f"chunk_shapes must have shape (npairs, 2), got {tuple(chunk_shapes.shape)}")
+    if chunk_boundaries.ndim != 1 or chunk_boundaries.shape[0] != chunk_shapes.shape[0] + 1:
+        raise ValueError(
+            "chunk_boundaries must be one-dimensional with length npairs + 1; "
+            f"got {tuple(chunk_boundaries.shape)} for npairs={chunk_shapes.shape[0]}"
+        )
+    if chunk_shapes.shape[0] != atom_pairs_shape[0]:
+        raise ValueError(
+            f"atom_pairs and chunk_shapes disagree on npairs: {atom_pairs_shape[0]} vs {chunk_shapes.shape[0]}"
+        )
+    if int(chunk_boundaries[0]) != 0:
+        raise ValueError("chunk_boundaries must start from 0")
+    if int(chunk_boundaries[-1]) != entries_size:
+        raise ValueError(
+            f"chunk_boundaries[-1] must equal entries length; got {chunk_boundaries[-1]} vs {entries_size}"
+        )
+
+    block_sizes = np.prod(chunk_shapes, axis=1, dtype=np.int64)
+    boundary_steps = np.diff(chunk_boundaries)
+    if not np.array_equal(boundary_steps, block_sizes):
+        bad_index = int(np.nonzero(boundary_steps != block_sizes)[0][0])
+        raise ValueError(
+            f"chunk boundary mismatch at pair {bad_index}: "
+            f"boundary step {boundary_steps[bad_index]}, shape product {block_sizes[bad_index]}"
+        )
+
+    observed_dims = sorted({int(item) for item in chunk_shapes.reshape(-1)})
+    valid_dims = set(expected_dims.values())
+    invalid_dims = [dimension for dimension in observed_dims if dimension not in valid_dims]
+    if invalid_dims:
+        raise ValueError(
+            f"Observed block dimensions {invalid_dims} do not match {spin_mode} orbital dimensions "
+            f"{expected_dims}. This often means spinful and spinless overlap/model data were mixed."
+        )
+
+    poscar_report: dict[str, Any] | None = None
+    if poscar_path.is_file():
+        poscar_summary = read_poscar_summary(poscar_path)
+        missing_elements = [
+            element for element in poscar_summary["composition"]
+            if element not in base_orbitals
+        ]
+        if missing_elements:
+            raise ValueError(f"POSCAR elements missing from elements_orbital_map: {missing_elements}")
+        expected_total_orbitals = sum(
+            count * base_orbitals[element] * spin_factor
+            for element, count in poscar_summary["composition"].items()
+        )
+        reported_total_orbitals = int(info.get("orbits_quantity", -1))
+        if reported_total_orbitals != expected_total_orbitals:
+            raise ValueError(
+                f"orbits_quantity mismatch: info.json reports {reported_total_orbitals}, "
+                f"but POSCAR and elements_orbital_map imply {expected_total_orbitals}"
+            )
+        poscar_report = {
+            "formula": poscar_summary["formula"],
+            "natoms": poscar_summary["natoms"],
+            "expected_total_orbitals": expected_total_orbitals,
+        }
+
+    return {
+        "status": "ok",
+        "output_dir": str(output_dir),
+        "spin_mode": spin_mode,
+        "base_orbitals_by_element": base_orbitals,
+        "expected_block_dims_by_element": expected_dims,
+        "observed_block_dims": observed_dims,
+        "npairs": int(chunk_shapes.shape[0]),
+        "entries": entries_size,
+        "poscar": poscar_report,
+    }
+
+
 def ensure_output_targets(output_dir: Path, manifest_path: Path, overwrite: bool, input_poscar: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     protected = [output_dir / "overlap.h5", output_dir / "info.json", manifest_path]
@@ -555,6 +679,12 @@ def build_parser() -> argparse.ArgumentParser:
             "formats when the basis itself is spin independent."
         ),
     )
+    parser.add_argument(
+        "--expect-spin",
+        choices=["any", "spinless", "spinful"],
+        default="any",
+        help="Optional guard for the requested output spin mode. Useful in production scripts.",
+    )
     parser.add_argument("--overwrite", action="store_true", help="Allow replacing overlap.h5/info.json/manifest in output-dir.")
     parser.add_argument("--dry-run", action="store_true", help="Validate inputs and write manifest without computing overlap.h5.")
     parser.add_argument("--verbose", action="store_true", help="Print progress details.")
@@ -576,6 +706,12 @@ def main() -> None:
         raise FileNotFoundError(f"Missing POSCAR: {poscar_path}")
     if not basis_dir.is_dir():
         raise FileNotFoundError(f"Missing basis directory: {basis_dir}")
+    requested_spin = "spinful" if args.spinful else "spinless"
+    if args.expect_spin != "any" and args.expect_spin != requested_spin:
+        raise ValueError(
+            f"--expect-spin {args.expect_spin} conflicts with requested output mode {requested_spin}. "
+            "Add --spinful for spinful output or remove it for spinless output."
+        )
 
     poscar_summary = read_poscar_summary(poscar_path)
     if args.expect_natoms is not None and poscar_summary["natoms"] != args.expect_natoms:
@@ -624,6 +760,7 @@ def main() -> None:
             "basis_code": args.basis_code,
             "ecut": args.ecut,
             "spinful": bool(args.spinful),
+            "expect_spin": args.expect_spin,
             "norm_tolerance": args.norm_tol,
             "allow_unnormalized_orbitals": allow_unnormalized,
         },
@@ -659,11 +796,33 @@ def main() -> None:
     manifest["output"]["overlap_h5"] = hdf5_summary(overlap_path)
     manifest["output"]["info_json_sha256"] = sha256_file(info_path)
     manifest["output"]["poscar_sha256"] = sha256_file(output_dir / "POSCAR")
+    manifest["output"]["validation"] = validate_deeph_overlap_dir(output_dir, expect_spin=requested_spin)
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     print(json.dumps(manifest["output"], indent=2))
     LOGGER.info("Wrote %s", overlap_path)
     LOGGER.info("Wrote %s", manifest_path)
+
+
+def build_check_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Validate a DeepH overlap directory before running deeph-infer."
+    )
+    parser.add_argument("output_dir", type=Path, help="Directory containing overlap.h5, info.json, and preferably POSCAR.")
+    parser.add_argument(
+        "--expect-spin",
+        choices=["any", "spinless", "spinful"],
+        default="any",
+        help="Fail if info.json reports a different spin mode.",
+    )
+    return parser
+
+
+def check_main() -> None:
+    parser = build_check_parser()
+    args = parser.parse_args()
+    report = validate_deeph_overlap_dir(args.output_dir, expect_spin=args.expect_spin)
+    print(json.dumps(report, indent=2))
 
 
 if __name__ == "__main__":
