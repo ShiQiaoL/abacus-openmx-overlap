@@ -84,6 +84,27 @@ direct-overlap DATA_DIR BASIS_DIR \
   --expect-natoms 28
 ```
 
+## Spin / 自旋
+
+中文：默认输出是 spinless spatial overlap。这对普通 collinear spin、没有 SOC/noncollinear 的情况通常足够，因为 overlap 不依赖自旋，spin-up 和 spin-down 共用同一个空间 overlap。
+
+English: The default output is a spinless spatial overlap. This is normally sufficient for collinear spin calculations without SOC/noncollinearity because the overlap is spin independent and shared by spin-up and spin-down channels.
+
+中文：如果你的下游 DeepH 数据格式需要 spinful/spinor matrix，可以加 `--spinful`。它会按照 `deepx-dock` 的原生策略把空间 overlap 复制到自旋对角块，也就是 `S_spin = I_2 \otimes S`。
+
+English: If your downstream DeepH format expects a spinful/spinor matrix, add `--spinful`. It follows the native `deepx-dock` strategy and duplicates the spatial overlap onto the spin diagonal blocks, i.e. `S_spin = I_2 \otimes S`.
+
+```bash
+direct-overlap DATA_DIR BASIS_DIR \
+  --basis-code abacus \
+  --output-dir OUT_DIR \
+  --spinful
+```
+
+中文：注意，这不会生成 SOC Hamiltonian，也不会引入 spin-mixing overlap；它只把 spin-independent overlap 写成 spinful matrix 形状。
+
+English: Note that this does not generate an SOC Hamiltonian and does not add spin-mixing overlap terms. It only writes the spin-independent overlap in a spinful matrix shape.
+
 ## 输出 / Outputs
 
 中文：输出目录会包含：

@@ -546,6 +546,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Fail on normalization deviations for all basis backends. ABACUS is strict by default; OpenMX warns by default.",
     )
+    parser.add_argument(
+        "--spinful",
+        action="store_true",
+        help=(
+            "Write a spinful overlap matrix by duplicating the spin-independent spatial overlap "
+            "onto the spin-up and spin-down diagonal blocks. Use this for spinor/SOC DeepH data "
+            "formats when the basis itself is spin independent."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true", help="Allow replacing overlap.h5/info.json/manifest in output-dir.")
     parser.add_argument("--dry-run", action="store_true", help="Validate inputs and write manifest without computing overlap.h5.")
     parser.add_argument("--verbose", action="store_true", help="Print progress details.")
@@ -614,7 +623,7 @@ def main() -> None:
         "parameters": {
             "basis_code": args.basis_code,
             "ecut": args.ecut,
-            "spinful": False,
+            "spinful": bool(args.spinful),
             "norm_tolerance": args.norm_tol,
             "allow_unnormalized_orbitals": allow_unnormalized,
         },
@@ -635,6 +644,8 @@ def main() -> None:
 
     LOGGER.info("Computing overlap for %s atoms with ecut=%s", poscar_summary["natoms"], args.ecut)
     overlaps = runtime.calc_overlap(aodata, Ecut=args.ecut)
+    if args.spinful:
+        overlaps.spinless_to_spinful()
     runtime.save_mat_deeph(output_dir, overlaps, "o")
     copy_poscar(poscar_path, output_dir)
 
