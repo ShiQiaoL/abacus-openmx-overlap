@@ -106,6 +106,40 @@ direct-overlap DATA_DIR BASIS_DIR \
 
 English: Note that this does not generate an SOC Hamiltonian and does not add spin-mixing overlap terms. It only writes the spin-independent overlap in a spinful matrix shape.
 
+## Fermi Level / 费米能级
+
+中文：`overlap.h5` 只由结构和 basis 决定，不能从 overlap-only 计算中得到 SCF Fermi level。直接生成时如果不提供 Fermi energy，`info.json` 只能写入 `0.0 eV` 占位值，这不应被当作收敛的费米能级。
+
+English: `overlap.h5` is determined only by the structure and basis. An SCF Fermi level cannot be derived from an overlap-only calculation. If no Fermi energy is provided, `info.json` can only contain a `0.0 eV` placeholder, which should not be treated as a converged Fermi level.
+
+推荐从收敛的 OpenMX/DFT 输出读取：
+
+Recommended usage with a converged OpenMX/DFT output:
+
+```bash
+direct-overlap DATA_DIR BASIS_DIR \
+  --basis-code openmx \
+  --output-dir OUT_DIR \
+  --fermi-log openmx.out \
+  --require-fermi-energy
+```
+
+也可以直接给 eV：
+
+You can also pass the value in eV directly:
+
+```bash
+direct-overlap DATA_DIR BASIS_DIR \
+  --basis-code openmx \
+  --output-dir OUT_DIR \
+  --fermi-energy-ev 1.2345 \
+  --require-fermi-energy
+```
+
+中文：OpenMX 输出中的 `Chemical potential (Hartree)` 会被自动转换为 eV。
+
+English: `Chemical potential (Hartree)` in OpenMX output is automatically converted to eV.
+
 ## 推理前检查 / Pre-Inference Check
 
 中文：为了避免 `deeph-infer` 里出现类似 `2704 vs 676` 的 JAX shape 错误，建议在推理前检查 overlap 目录的 spin mode 和 HDF5 block shape。
@@ -122,6 +156,16 @@ direct-overlap-check DFT_OUT_DIR --expect-spin spinless
 
 ```bash
 direct-overlap-check DFT_OUT_DIR --expect-spin spinful
+```
+
+同时要求 Fermi energy 必须来自显式输入：
+
+Also require the Fermi energy to come from an explicit input:
+
+```bash
+direct-overlap-check DFT_OUT_DIR \
+  --expect-spin spinful \
+  --require-fermi-energy
 ```
 
 中文：`direct-overlap` 生成文件后也会自动做同样的自洽检查，并把结果写入 `direct_overlap_manifest.json`。

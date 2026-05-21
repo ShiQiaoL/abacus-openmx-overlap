@@ -24,6 +24,7 @@ import numpy as np
 LOGGER = logging.getLogger("direct-overlap")
 SCHEMA_VERSION = "direct-overlap-basis/2"
 ANGULAR_MOMENTA = {"s": 0, "p": 1, "d": 2, "f": 3, "g": 4, "h": 5}
+HARTREE_TO_EV = 27.211386245988
 
 
 def normalize_path(path: Path) -> Path:
@@ -55,6 +56,114 @@ def software_versions() -> dict[str, str | None]:
         "h5py": package_version("h5py"),
         "hpro": package_version("hpro"),
         "deepx-dock": package_version("deepx-dock"),
+    }
+
+
+def parse_energy_unit(unit_text: str | None) -> str:
+    if unit_text is None:
+        return "hartree"
+    normalized = unit_text.strip().lower()
+    if normalized in {"ev", "electronvolt", "electronvolts"}:
+        return "ev"
+    if normalized in {"hartree", "ha", "hartrees", "a.u.", "au"}:
+        return "hartree"
+    raise ValueError(f"Unsupported energy unit: {unit_text}")
+
+
+def convert_energy_to_ev(value: float, unit_text: str | None) -> float:
+    unit = parse_energy_unit(unit_text)
+    if unit == "ev":
+        return value
+    if unit == "hartree":
+        return value * HARTREE_TO_EV
+    raise AssertionError(f"Unhandled energy unit: {unit}")
+
+
+def parse_fermi_log(path: Path) -> dict[str, Any]:
+    """Parse a Fermi level / chemical potential from a text output file."""
+    patterns = [
+        re.compile(
+            r"Chemical\s+potential\s*\((?P<unit>Hartree|Ha|eV)\)\s*[:=]?\s*"
+            r"(?P<value>[-+]?\d+(?:\.\d*)?(?:[Ee][-+]?\d+)?)",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"(?:Fermi\s+(?:level|energy)|E[_-]?F)\s*\((?P<unit>Hartree|Ha|eV)\)\s*[:=]?\s*"
+            r"(?P<value>[-+]?\d+(?:\.\d*)?(?:[Ee][-+]?\d+)?)",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"(?P<label>ChemP)\s*(?:\((?P<unit>Hartree|Ha|eV)\))?\s*[:=]?\s*"
+            r"(?P<value>[-+]?\d+(?:\.\d*)?(?:[Ee][-+]?\d+)?)",
+            re.IGNORECASE,
+        ),
+    ]
+
+    matches: list[dict[str, Any]] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
+        for pattern in patterns:
+            match = pattern.search(line)
+            if match is None:
+                continue
+            unit = match.groupdict().get("unit")
+            value = float(match.group("value"))
+            matches.append(
+                {
+                    "fermi_energy_eV": convert_energy_to_ev(value, unit),
+                    "raw_value": value,
+                    "raw_unit": parse_energy_unit(unit),
+                    "line_number": line_number,
+                    "line": line.strip(),
+                    "path": str(path),
+                }
+            )
+            break
+
+    if not matches:
+        raise ValueError(
+            f"Could not find a Fermi level / chemical potential in {path}. "
+            "For OpenMX, use a converged .out/.log containing 'Chemical potential (Hartree)', "
+            "or pass --fermi-energy-ev explicitly."
+        )
+    return matches[-1]
+
+
+def resolve_fermi_energy(args: argparse.Namespace) -> dict[str, Any]:
+    if args.fermi_energy_ev is not None and args.fermi_log is not None:
+        raise ValueError("Use only one of --fermi-energy-ev or --fermi-log, not both.")
+
+    if args.fermi_energy_ev is not None:
+        return {
+            "provided": True,
+            "source": "cli",
+            "fermi_energy_eV": float(args.fermi_energy_ev),
+            "note": "User-provided SCF Fermi energy.",
+        }
+
+    if args.fermi_log is not None:
+        log_path = normalize_path(args.fermi_log)
+        if not log_path.is_file():
+            raise FileNotFoundError(f"Missing Fermi log file: {log_path}")
+        parsed = parse_fermi_log(log_path)
+        parsed["provided"] = True
+        parsed["source"] = "log"
+        parsed["note"] = "Parsed from a user-provided SCF output/log file."
+        return parsed
+
+    if args.require_fermi_energy:
+        raise ValueError(
+            "No SCF Fermi energy was provided. Direct overlap generation cannot determine the Fermi level. "
+            "Pass --fermi-energy-ev VALUE or --fermi-log PATH, or remove --require-fermi-energy."
+        )
+
+    return {
+        "provided": False,
+        "source": "default_zero",
+        "fermi_energy_eV": 0.0,
+        "note": (
+            "No SCF Fermi energy was provided. info.json will contain 0.0 eV as a placeholder; "
+            "do not treat it as a converged Fermi level."
+        ),
     }
 
 
@@ -479,7 +588,13 @@ def orbital_count_from_l_list(angular_momenta: list[int]) -> int:
     return int(sum(2 * int(angular_momentum) + 1 for angular_momentum in angular_momenta))
 
 
-def validate_deeph_overlap_dir(output_dir: Path, expect_spin: str = "any") -> dict[str, Any]:
+def validate_deeph_overlap_dir(
+    output_dir: Path,
+    expect_spin: str = "any",
+    require_fermi_energy: bool = False,
+    expect_fermi_energy_ev: float | None = None,
+    fermi_tolerance_ev: float = 1.0e-6,
+) -> dict[str, Any]:
     import h5py
 
     output_dir = normalize_path(output_dir)
@@ -492,6 +607,8 @@ def validate_deeph_overlap_dir(output_dir: Path, expect_spin: str = "any") -> di
         raise FileNotFoundError(f"Missing overlap.h5: {overlap_path}")
 
     info = json.loads(info_path.read_text(encoding="utf-8"))
+    manifest_path = output_dir / "direct_overlap_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else None
     spinful = bool(info.get("spinful", False))
     spin_mode = "spinful" if spinful else "spinless"
     if expect_spin != "any" and spin_mode != expect_spin:
@@ -512,6 +629,37 @@ def validate_deeph_overlap_dir(output_dir: Path, expect_spin: str = "any") -> di
         element: count * spin_factor
         for element, count in base_orbitals.items()
     }
+    fermi_energy_ev = info.get("fermi_energy_eV")
+    if fermi_energy_ev is None:
+        raise ValueError(f"{info_path} does not contain fermi_energy_eV")
+    fermi_energy_ev = float(fermi_energy_ev)
+
+    fermi_source = "unknown"
+    fermi_provided = None
+    if manifest is not None:
+        fermi_report = manifest.get("fermi_energy", {})
+        fermi_source = str(fermi_report.get("source", "unknown"))
+        fermi_provided = bool(fermi_report.get("provided", False))
+
+    if require_fermi_energy:
+        if manifest is None:
+            raise ValueError(
+                "Cannot prove that fermi_energy_eV came from an SCF calculation because "
+                "direct_overlap_manifest.json is missing. Regenerate with --fermi-energy-ev "
+                "or --fermi-log, or provide a manifest."
+            )
+        if not fermi_provided:
+            raise ValueError(
+                "Fermi energy is required, but this overlap directory was generated without "
+                "an SCF Fermi energy. Regenerate with --fermi-energy-ev VALUE or --fermi-log PATH."
+            )
+    if expect_fermi_energy_ev is not None:
+        difference = abs(fermi_energy_ev - expect_fermi_energy_ev)
+        if difference > fermi_tolerance_ev:
+            raise ValueError(
+                f"Fermi energy mismatch: info.json has {fermi_energy_ev:.12g} eV, "
+                f"expected {expect_fermi_energy_ev:.12g} eV, diff {difference:.3e} eV."
+            )
 
     with h5py.File(overlap_path, "r") as handle:
         for dataset in ["atom_pairs", "chunk_boundaries", "chunk_shapes", "entries"]:
@@ -570,26 +718,33 @@ def validate_deeph_overlap_dir(output_dir: Path, expect_spin: str = "any") -> di
         ]
         if missing_elements:
             raise ValueError(f"POSCAR elements missing from elements_orbital_map: {missing_elements}")
-        expected_total_orbitals = sum(
-            count * base_orbitals[element] * spin_factor
+        expected_spatial_orbitals = sum(
+            count * base_orbitals[element]
             for element, count in poscar_summary["composition"].items()
         )
+        expected_spinful_orbitals = expected_spatial_orbitals * spin_factor
         reported_total_orbitals = int(info.get("orbits_quantity", -1))
-        if reported_total_orbitals != expected_total_orbitals:
+        if reported_total_orbitals != expected_spatial_orbitals:
             raise ValueError(
                 f"orbits_quantity mismatch: info.json reports {reported_total_orbitals}, "
-                f"but POSCAR and elements_orbital_map imply {expected_total_orbitals}"
+                f"but POSCAR and elements_orbital_map imply {expected_spatial_orbitals} spatial orbitals. "
+                "In the DeepH/HPRO new interface, info.json orbits_quantity stores the spatial-orbital count; "
+                "spinful doubling is represented in overlap.h5 block shapes, not in orbits_quantity."
             )
         poscar_report = {
             "formula": poscar_summary["formula"],
             "natoms": poscar_summary["natoms"],
-            "expected_total_orbitals": expected_total_orbitals,
+            "expected_spatial_orbitals": expected_spatial_orbitals,
+            "expected_matrix_orbitals": expected_spinful_orbitals,
         }
 
     return {
         "status": "ok",
         "output_dir": str(output_dir),
         "spin_mode": spin_mode,
+        "fermi_energy_eV": fermi_energy_ev,
+        "fermi_energy_source": fermi_source,
+        "fermi_energy_provided": fermi_provided,
         "base_orbitals_by_element": base_orbitals,
         "expected_block_dims_by_element": expected_dims,
         "observed_block_dims": observed_dims,
@@ -685,6 +840,23 @@ def build_parser() -> argparse.ArgumentParser:
         default="any",
         help="Optional guard for the requested output spin mode. Useful in production scripts.",
     )
+    parser.add_argument(
+        "--fermi-energy-ev",
+        type=float,
+        default=None,
+        help="SCF Fermi energy / chemical potential in eV to write into info.json.",
+    )
+    parser.add_argument(
+        "--fermi-log",
+        type=Path,
+        default=None,
+        help="Parse SCF Fermi energy from a log/output file. OpenMX 'Chemical potential (Hartree)' is supported.",
+    )
+    parser.add_argument(
+        "--require-fermi-energy",
+        action="store_true",
+        help="Fail unless --fermi-energy-ev or --fermi-log is provided.",
+    )
     parser.add_argument("--overwrite", action="store_true", help="Allow replacing overlap.h5/info.json/manifest in output-dir.")
     parser.add_argument("--dry-run", action="store_true", help="Validate inputs and write manifest without computing overlap.h5.")
     parser.add_argument("--verbose", action="store_true", help="Print progress details.")
@@ -712,6 +884,7 @@ def main() -> None:
             f"--expect-spin {args.expect_spin} conflicts with requested output mode {requested_spin}. "
             "Add --spinful for spinful output or remove it for spinless output."
         )
+    fermi_report = resolve_fermi_energy(args)
 
     poscar_summary = read_poscar_summary(poscar_path)
     if args.expect_natoms is not None and poscar_summary["natoms"] != args.expect_natoms:
@@ -761,9 +934,12 @@ def main() -> None:
             "ecut": args.ecut,
             "spinful": bool(args.spinful),
             "expect_spin": args.expect_spin,
+            "fermi_energy_eV": fermi_report["fermi_energy_eV"],
+            "fermi_energy_source": fermi_report["source"],
             "norm_tolerance": args.norm_tol,
             "allow_unnormalized_orbitals": allow_unnormalized,
         },
+        "fermi_energy": fermi_report,
         "software": software_versions(),
         "output": {
             "output_dir": str(output_dir),
@@ -783,6 +959,9 @@ def main() -> None:
     overlaps = runtime.calc_overlap(aodata, Ecut=args.ecut)
     if args.spinful:
         overlaps.spinless_to_spinful()
+    overlaps.structure.efermi = float(fermi_report["fermi_energy_eV"]) / HARTREE_TO_EV
+    if not fermi_report["provided"]:
+        LOGGER.warning("%s", fermi_report["note"])
     runtime.save_mat_deeph(output_dir, overlaps, "o")
     copy_poscar(poscar_path, output_dir)
 
@@ -796,7 +975,13 @@ def main() -> None:
     manifest["output"]["overlap_h5"] = hdf5_summary(overlap_path)
     manifest["output"]["info_json_sha256"] = sha256_file(info_path)
     manifest["output"]["poscar_sha256"] = sha256_file(output_dir / "POSCAR")
-    manifest["output"]["validation"] = validate_deeph_overlap_dir(output_dir, expect_spin=requested_spin)
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    manifest["output"]["validation"] = validate_deeph_overlap_dir(
+        output_dir,
+        expect_spin=requested_spin,
+        require_fermi_energy=args.require_fermi_energy,
+        expect_fermi_energy_ev=float(fermi_report["fermi_energy_eV"]) if fermi_report["provided"] else None,
+    )
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     print(json.dumps(manifest["output"], indent=2))
@@ -815,13 +1000,36 @@ def build_check_parser() -> argparse.ArgumentParser:
         default="any",
         help="Fail if info.json reports a different spin mode.",
     )
+    parser.add_argument(
+        "--require-fermi-energy",
+        action="store_true",
+        help="Fail unless the direct-overlap manifest proves an SCF Fermi energy was provided.",
+    )
+    parser.add_argument(
+        "--expect-fermi-energy-ev",
+        type=float,
+        default=None,
+        help="Fail unless info.json fermi_energy_eV matches this value.",
+    )
+    parser.add_argument(
+        "--fermi-tol-ev",
+        type=float,
+        default=1.0e-6,
+        help="Tolerance for --expect-fermi-energy-ev.",
+    )
     return parser
 
 
 def check_main() -> None:
     parser = build_check_parser()
     args = parser.parse_args()
-    report = validate_deeph_overlap_dir(args.output_dir, expect_spin=args.expect_spin)
+    report = validate_deeph_overlap_dir(
+        args.output_dir,
+        expect_spin=args.expect_spin,
+        require_fermi_energy=args.require_fermi_energy,
+        expect_fermi_energy_ev=args.expect_fermi_energy_ev,
+        fermi_tolerance_ev=args.fermi_tol_ev,
+    )
     print(json.dumps(report, indent=2))
 
 
