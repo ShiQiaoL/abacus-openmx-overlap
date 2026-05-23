@@ -172,6 +172,34 @@ direct-overlap-check DFT_OUT_DIR \
 
 English: `direct-overlap` runs the same consistency check after generation and stores the report in `direct_overlap_manifest.json`.
 
+## 能带计算防呆 / Band-Calculation Guard
+
+中文：`dock compute eigen calc-band` 和 `deeph-infer` 对 spinful overlap 的约定不完全一样。对 SOC/spinful Hamiltonian 做能带时，`hamiltonian.h5` 是双倍 spinor block，但 `overlap.h5` 应保持 spatial/spinless；`dock` 会在内部扩展 overlap。不要把 `orbits_quantity` 改成两倍。
+
+English: `dock compute eigen calc-band` and `deeph-infer` do not use exactly the same spinful-overlap convention. For SOC/spinful Hamiltonian band calculations, `hamiltonian.h5` is doubled in spinor space, but `overlap.h5` should remain spatial/spinless; `dock` expands the overlap internally. Do not double `orbits_quantity`.
+
+中文：推荐先运行防呆准备命令。它会扫描 `info.json`、`hamiltonian.h5`、`overlap.h5`，自动选择匹配的 spatial overlap，并生成干净的 `band_ready/` 目录：
+
+English: Use the guard command before band calculation. It scans `info.json`, `hamiltonian.h5`, and `overlap.h5`, selects a compatible spatial overlap, and writes a clean `band_ready/` directory:
+
+```bash
+direct-overlap-band-prep CASE_ROOT --out-dir band_ready --overwrite --yes
+cd band_ready
+dock compute eigen calc-band ./ --parallel-num 5 --thread-num 1
+```
+
+中文：如果不加 `--yes` 且在交互终端运行，它会先显示中文诊断并询问是否继续。只想检查、不写文件时：
+
+English: Without `--yes` in an interactive terminal, it prints a human-readable diagnosis and asks before writing. To inspect only:
+
+```bash
+direct-overlap-band-prep CASE_ROOT --diagnose-only
+```
+
+中文：典型错误 `could not broadcast input array from shape (52,52) into shape (26,26)` 通常意味着 `hamiltonian.h5` 是 spinful，但 `info.json` 或 `overlap.h5` 仍按 spinless / 错误 basis 处理。这个命令会在运行 `calc-band` 前提前拦截。
+
+English: The typical error `could not broadcast input array from shape (52,52) into shape (26,26)` usually means `hamiltonian.h5` is spinful while `info.json` or `overlap.h5` still follows a spinless or wrong-basis convention. This command catches that before `calc-band`.
+
 ## 输出 / Outputs
 
 中文：输出目录会包含：

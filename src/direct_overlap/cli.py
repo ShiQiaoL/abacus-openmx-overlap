@@ -8,11 +8,14 @@ import hashlib
 import importlib.metadata as importlib_metadata
 import json
 import logging
+import os
 import platform
 import re
 import shutil
+import subprocess
 import sys
 from collections import OrderedDict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,6 +28,23 @@ LOGGER = logging.getLogger("direct-overlap")
 SCHEMA_VERSION = "direct-overlap-basis/2"
 ANGULAR_MOMENTA = {"s": 0, "p": 1, "d": 2, "f": 3, "g": 4, "h": 5}
 HARTREE_TO_EV = 27.211386245988
+MATRIX_DATASETS = ("atom_pairs", "chunk_boundaries", "chunk_shapes", "entries")
+PREPARED_BAND_FILES = (
+    "POSCAR",
+    "K_PATH",
+    "hamiltonian.h5",
+    "overlap.h5",
+    "info.json",
+    "band_prepare_manifest.json",
+)
+STALE_BAND_OUTPUTS = (
+    "band.h5",
+    "band.png",
+    "fermi_energy.json",
+    "eigval.h5",
+    "dos.h5",
+    "dos.png",
+)
 
 
 def normalize_path(path: Path) -> Path:
@@ -584,8 +604,332 @@ def hdf5_summary(path: Path) -> dict[str, Any]:
     }
 
 
+@dataclass(frozen=True)
+class MatrixSignature:
+    path: Path
+    atom_pairs: np.ndarray
+    chunk_shapes: np.ndarray
+    entries_dtype: str
+    entries_len: int
+    size_bytes: int
+
+    @property
+    def unique_shapes(self) -> list[list[int]]:
+        return np.unique(self.chunk_shapes, axis=0).astype(int).tolist()
+
+    @property
+    def max_shape(self) -> list[int]:
+        return self.chunk_shapes.max(axis=0).astype(int).tolist()
+
+
+def read_matrix_signature(path: Path) -> MatrixSignature:
+    import h5py
+
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    with h5py.File(path, "r") as handle:
+        missing = [dataset for dataset in MATRIX_DATASETS if dataset not in handle]
+        if missing:
+            raise ValueError(f"{path} is missing HDF5 datasets: {missing}")
+        atom_pairs = np.asarray(handle["atom_pairs"][:], dtype=np.int64)
+        chunk_shapes = np.asarray(handle["chunk_shapes"][:], dtype=np.int64)
+        entries = handle["entries"]
+        entries_dtype = str(entries.dtype)
+        entries_len = int(entries.shape[0])
+    if atom_pairs.ndim != 2 or atom_pairs.shape[1] != 5:
+        raise ValueError(f"{path}: atom_pairs must have shape (npairs, 5), got {atom_pairs.shape}")
+    if chunk_shapes.ndim != 2 or chunk_shapes.shape[1] != 2:
+        raise ValueError(f"{path}: chunk_shapes must have shape (npairs, 2), got {chunk_shapes.shape}")
+    if len(atom_pairs) != len(chunk_shapes):
+        raise ValueError(f"{path}: atom_pairs/chunk_shapes length mismatch")
+    return MatrixSignature(
+        path=path,
+        atom_pairs=atom_pairs,
+        chunk_shapes=chunk_shapes,
+        entries_dtype=entries_dtype,
+        entries_len=entries_len,
+        size_bytes=path.stat().st_size,
+    )
+
+
+def read_poscar_elements(poscar_path: Path) -> tuple[list[str], list[int], list[str]]:
+    lines = poscar_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if len(lines) < 7:
+        raise ValueError(f"{poscar_path} is too short to be a VASP 5 POSCAR")
+    species = lines[5].split()
+    counts = [int(item) for item in lines[6].split()]
+    if len(species) != len(counts):
+        raise ValueError(f"{poscar_path}: element/count length mismatch")
+    elements_by_atom: list[str] = []
+    for element, count in zip(species, counts, strict=True):
+        elements_by_atom.extend([element] * count)
+    return species, counts, elements_by_atom
+
+
 def orbital_count_from_l_list(angular_momenta: list[int]) -> int:
     return int(sum(2 * int(angular_momentum) + 1 for angular_momentum in angular_momenta))
+
+
+def orbital_counts_from_info(info: dict[str, Any], poscar_path: Path) -> tuple[list[int], dict[str, int], int]:
+    species, counts, elements_by_atom = read_poscar_elements(poscar_path)
+    orbital_map = info.get("elements_orbital_map")
+    if not isinstance(orbital_map, dict) or not orbital_map:
+        raise ValueError("info.json does not contain a valid elements_orbital_map")
+    per_element = {
+        element: orbital_count_from_l_list(orbital_map[element])
+        for element in species
+    }
+    per_atom = [per_element[element] for element in elements_by_atom]
+    total = int(sum(count * per_element[element] for element, count in zip(species, counts, strict=True)))
+    return per_atom, per_element, total
+
+
+def matrix_shape_match_report(
+    signature: MatrixSignature,
+    per_atom_orbitals: list[int],
+    spin_factor: int,
+) -> tuple[bool, str]:
+    if spin_factor < 1:
+        raise ValueError("spin_factor must be >= 1")
+    if len(signature.atom_pairs) != len(signature.chunk_shapes):
+        return False, "atom_pairs and chunk_shapes length mismatch"
+    for pair_index, (atom_pair, shape) in enumerate(zip(signature.atom_pairs, signature.chunk_shapes, strict=True)):
+        i_atom = int(atom_pair[3])
+        j_atom = int(atom_pair[4])
+        if i_atom < 0 or i_atom >= len(per_atom_orbitals) or j_atom < 0 or j_atom >= len(per_atom_orbitals):
+            return False, f"pair {pair_index}: atom index outside POSCAR atom count"
+        expected = (per_atom_orbitals[i_atom] * spin_factor, per_atom_orbitals[j_atom] * spin_factor)
+        observed = (int(shape[0]), int(shape[1]))
+        if observed != expected:
+            return False, f"pair {pair_index}: observed {observed}, expected {expected}"
+    return True, "ok"
+
+
+def same_atom_pairs(left: MatrixSignature, right: MatrixSignature) -> bool:
+    return left.atom_pairs.shape == right.atom_pairs.shape and np.array_equal(left.atom_pairs, right.atom_pairs)
+
+
+def path_is_same_or_inside(path: Path, parent: Path) -> bool:
+    try:
+        normalize_path(path).relative_to(normalize_path(parent))
+        return True
+    except ValueError:
+        return False
+
+
+def find_dirs_with_file(
+    root: Path,
+    filename: str,
+    exclude_dir: Path | None = None,
+    exclude_prepared: bool = True,
+) -> list[Path]:
+    dirs: list[Path] = []
+    for path in root.rglob(filename):
+        if not path.is_file():
+            continue
+        candidate = path.parent
+        if exclude_dir is not None and path_is_same_or_inside(candidate, exclude_dir):
+            continue
+        if exclude_prepared and (candidate / "band_prepare_manifest.json").is_file():
+            continue
+        dirs.append(candidate)
+    return sorted(set(dirs), key=lambda item: item.stat().st_mtime, reverse=True)
+
+
+def prepare_output_directory(out_dir: Path, overwrite: bool) -> None:
+    if not out_dir.exists():
+        out_dir.mkdir(parents=True)
+        return
+    if not out_dir.is_dir():
+        raise NotADirectoryError(out_dir)
+    if not overwrite:
+        raise FileExistsError(f"{out_dir} already exists; pass --overwrite or choose another --out-dir")
+    for filename in (*PREPARED_BAND_FILES, *STALE_BAND_OUTPUTS):
+        target = out_dir / filename
+        if target.exists() or target.is_symlink():
+            target.unlink()
+
+
+def materialize_file(src: Path, dst: Path, link_mode: str) -> None:
+    if dst.exists() or dst.is_symlink():
+        dst.unlink()
+    if link_mode == "copy":
+        shutil.copy2(src, dst)
+    elif link_mode == "hardlink":
+        try:
+            os.link(src, dst)
+        except OSError:
+            shutil.copy2(src, dst)
+    elif link_mode == "symlink":
+        try:
+            os.symlink(src, dst)
+        except OSError:
+            shutil.copy2(src, dst)
+    else:
+        raise ValueError(f"Unknown link mode: {link_mode}")
+
+
+def candidate_info_report(candidate_dir: Path, ham_sig: MatrixSignature) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "dir": str(candidate_dir),
+        "has_info": (candidate_dir / "info.json").is_file(),
+        "has_poscar": (candidate_dir / "POSCAR").is_file(),
+        "has_overlap": (candidate_dir / "overlap.h5").is_file(),
+    }
+    if not report["has_info"] or not report["has_poscar"]:
+        report["status"] = "skip"
+        report["reason"] = "missing info.json or POSCAR"
+        return report
+    try:
+        info = json.loads((candidate_dir / "info.json").read_text(encoding="utf-8"))
+        per_atom, per_element, spatial_total = orbital_counts_from_info(info, candidate_dir / "POSCAR")
+        reported_orbits = int(info.get("orbits_quantity", -1))
+        report.update(
+            {
+                "info_spinful": bool(info.get("spinful", False)),
+                "reported_orbits_quantity": reported_orbits,
+                "spatial_orbits_quantity": spatial_total,
+                "per_element_spatial_orbitals": per_element,
+            }
+        )
+        if reported_orbits != spatial_total:
+            report["status"] = "bad"
+            report["reason"] = (
+                f"info.json orbits_quantity={reported_orbits}, but POSCAR/elements_orbital_map imply "
+                f"{spatial_total} spatial orbitals"
+            )
+            return report
+        h_spinless_ok, h_spinless_reason = matrix_shape_match_report(ham_sig, per_atom, spin_factor=1)
+        h_spinful_ok, h_spinful_reason = matrix_shape_match_report(ham_sig, per_atom, spin_factor=2)
+        report["hamiltonian_matches_spinless_info"] = h_spinless_ok
+        report["hamiltonian_matches_spinful_info"] = h_spinful_ok
+        if h_spinful_ok:
+            report["hamiltonian_spin_mode"] = "spinful"
+        elif h_spinless_ok:
+            report["hamiltonian_spin_mode"] = "spinless"
+        else:
+            report["status"] = "bad"
+            report["reason"] = f"H does not match this info.json as spinless ({h_spinless_reason}) or spinful ({h_spinful_reason})"
+            return report
+
+        if report["has_overlap"]:
+            s_sig = read_matrix_signature(candidate_dir / "overlap.h5")
+            report["overlap_unique_shapes"] = s_sig.unique_shapes
+            if not same_atom_pairs(ham_sig, s_sig):
+                report["overlap_matches_for_band"] = False
+                report["overlap_reason"] = "atom_pairs differ between hamiltonian.h5 and overlap.h5"
+            else:
+                s_ok, s_reason = matrix_shape_match_report(s_sig, per_atom, spin_factor=1)
+                report["overlap_matches_for_band"] = s_ok
+                report["overlap_reason"] = s_reason
+        report["status"] = "ok"
+        return report
+    except Exception as exc:
+        report["status"] = "bad"
+        report["reason"] = str(exc)
+        return report
+
+
+def choose_band_sources(
+    case_root: Path,
+    ham_dir: Path | None,
+    overlap_dir: Path | None,
+    out_dir: Path,
+    requested_spin: str,
+) -> dict[str, Any]:
+    if ham_dir is not None:
+        selected_ham_dir = normalize_path(ham_dir)
+        if selected_ham_dir.is_file():
+            selected_ham_dir = selected_ham_dir.parent
+        if not (selected_ham_dir / "hamiltonian.h5").is_file():
+            raise FileNotFoundError(f"{selected_ham_dir} does not contain hamiltonian.h5")
+    else:
+        candidates = find_dirs_with_file(case_root, "hamiltonian.h5", exclude_dir=out_dir)
+        if not candidates:
+            raise FileNotFoundError(f"No hamiltonian.h5 found under {case_root}")
+        selected_ham_dir = candidates[0]
+
+    ham_sig = read_matrix_signature(selected_ham_dir / "hamiltonian.h5")
+    info_dirs = find_dirs_with_file(case_root, "info.json", exclude_dir=out_dir)
+    reports = [candidate_info_report(candidate, ham_sig) for candidate in info_dirs]
+    matching_info = [
+        report for report in reports
+        if report.get("status") == "ok"
+        and report.get(f"hamiltonian_matches_{requested_spin}_info")
+    ]
+    if not matching_info:
+        readable = "\n".join(
+            f"- {report.get('dir')}: {report.get('reason', report.get('status'))}"
+            for report in reports[:12]
+        )
+        raise ValueError(
+            f"Could not find info.json/POSCAR matching hamiltonian.h5 as {requested_spin}.\n"
+            "This usually means the Hamiltonian and overlap were generated with different basis labels.\n"
+            f"Checked candidates:\n{readable}"
+        )
+
+    compatible: list[dict[str, Any]] = []
+    for report in matching_info:
+        candidate_dir = Path(str(report["dir"]))
+        if overlap_dir is not None:
+            requested_overlap_dir = normalize_path(overlap_dir)
+            if requested_overlap_dir.is_file():
+                requested_overlap_dir = requested_overlap_dir.parent
+            if normalize_path(candidate_dir) != requested_overlap_dir:
+                continue
+            report = candidate_info_report(candidate_dir, ham_sig)
+        if report.get("overlap_matches_for_band"):
+            compatible.append(report)
+
+    if not compatible:
+        readable = "\n".join(
+            f"- {report.get('dir')}: {report.get('overlap_reason', report.get('reason', report.get('status')))}"
+            for report in matching_info[:12]
+        )
+        raise ValueError(
+            "Found metadata matching hamiltonian.h5, but no spatial overlap.h5 compatible with dock calc-band.\n"
+            "For spinful/SOC calc-band, overlap.h5 must stay spatial/spinless; do not feed a doubled spinful overlap.\n"
+            f"Checked candidates:\n{readable}"
+        )
+
+    selected = compatible[0]
+    selected_overlap_dir = Path(str(selected["dir"]))
+    return {
+        "ham_dir": selected_ham_dir,
+        "overlap_dir": selected_overlap_dir,
+        "ham_signature": ham_sig,
+        "overlap_signature": read_matrix_signature(selected_overlap_dir / "overlap.h5"),
+        "selected_report": selected,
+        "candidate_reports": reports,
+    }
+
+
+def explain_band_prep_choice(choice: dict[str, Any], requested_spin: str) -> str:
+    ham_sig: MatrixSignature = choice["ham_signature"]
+    overlap_sig: MatrixSignature = choice["overlap_signature"]
+    selected = choice["selected_report"]
+    lines = [
+        "检测结果 / Diagnosis:",
+        f"- Hamiltonian source: {choice['ham_dir']}",
+        f"- Overlap source: {choice['overlap_dir']}",
+        f"- Band spin mode: {requested_spin}",
+        f"- info.json spatial orbits_quantity: {selected.get('spatial_orbits_quantity')}",
+        f"- per-element spatial orbitals: {selected.get('per_element_spatial_orbitals')}",
+        f"- hamiltonian.h5 dtype: {ham_sig.entries_dtype}, max block shape: {ham_sig.max_shape}",
+        f"- overlap.h5 dtype: {overlap_sig.entries_dtype}, max block shape: {overlap_sig.max_shape}",
+    ]
+    if requested_spin == "spinful":
+        lines.extend(
+            [
+                "",
+                "说明 / Note:",
+                "- 对 SOC/spinful band 计算，hamiltonian.h5 是双倍 spinor block。",
+                "- 但 overlap.h5 应保持 spatial/spinless，dock 会在内部扩展 S。",
+                "- 不要把 orbits_quantity 改成两倍；它仍然是 spatial orbital 总数。",
+            ]
+        )
+    return "\n".join(lines)
+
 
 
 def validate_deeph_overlap_dir(
@@ -1031,6 +1375,157 @@ def check_main() -> None:
         fermi_tolerance_ev=args.fermi_tol_ev,
     )
     print(json.dumps(report, indent=2))
+
+
+def build_band_prep_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Prepare a DeepH-dock calc-band directory and prevent spinful/spinless "
+            "hamiltonian/overlap metadata mismatches."
+        )
+    )
+    parser.add_argument("case_root", type=Path, help="Case root containing inference outputs and/or dft directories.")
+    parser.add_argument("--ham-dir", type=Path, default=None, help="Directory or hamiltonian.h5 file to use.")
+    parser.add_argument("--overlap-dir", type=Path, default=None, help="Directory or overlap.h5 file to use.")
+    parser.add_argument("--out-dir", type=Path, default=None, help="Output directory. Default: case_root/band_ready.")
+    parser.add_argument(
+        "--spin",
+        choices=["auto", "spinless", "spinful"],
+        default="auto",
+        help="Band spin mode. auto currently chooses spinful when Hamiltonian matches spinful metadata.",
+    )
+    parser.add_argument("--fermi-energy-ev", type=float, default=None, help="Override fermi_energy_eV in output info.json.")
+    parser.add_argument("--overwrite", action="store_true", help="Replace prepared files in --out-dir.")
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Do not ask for confirmation before writing files. Useful in batch scripts.",
+    )
+    parser.add_argument(
+        "--diagnose-only",
+        action="store_true",
+        help="Only print the detected action; do not write files.",
+    )
+    parser.add_argument(
+        "--link-mode",
+        choices=["hardlink", "copy", "symlink"],
+        default="hardlink",
+        help="How to place large HDF5 files in --out-dir. Falls back to copy when linking fails.",
+    )
+    parser.add_argument("--run-calc-band", action="store_true", help="Run dock compute eigen calc-band after preparation.")
+    parser.add_argument("--dock-bin", default="dock", help="dock executable for --run-calc-band.")
+    parser.add_argument("--parallel-num", "-p", default="5", help="parallel-num passed to calc-band.")
+    parser.add_argument("--thread-num", default="1", help="thread-num passed to calc-band.")
+    return parser
+
+
+def band_prep_main() -> None:
+    parser = build_band_prep_parser()
+    args = parser.parse_args()
+    case_root = normalize_path(args.case_root)
+    if not case_root.is_dir():
+        raise FileNotFoundError(f"Missing case root: {case_root}")
+    out_dir = normalize_path(args.out_dir) if args.out_dir is not None else case_root / "band_ready"
+
+    requested_spin = args.spin
+    if requested_spin == "auto":
+        requested_spin = "spinful"
+    choice = choose_band_sources(
+        case_root=case_root,
+        ham_dir=args.ham_dir,
+        overlap_dir=args.overlap_dir,
+        out_dir=out_dir,
+        requested_spin=requested_spin,
+    )
+    message = explain_band_prep_choice(choice, requested_spin)
+    print(message)
+
+    if args.diagnose_only:
+        print("\n诊断模式：没有写入任何文件。")
+        return
+
+    if not args.yes and sys.stdin.isatty():
+        answer = input(f"\n是否生成 calc-band 可用目录 {out_dir}? [Y/n] ").strip().lower()
+        if answer not in {"", "y", "yes"}:
+            print("已取消。")
+            return
+
+    selected = choice["selected_report"]
+    selected_overlap_dir = Path(str(choice["overlap_dir"]))
+    selected_ham_dir = Path(str(choice["ham_dir"]))
+    info = json.loads((selected_overlap_dir / "info.json").read_text(encoding="utf-8"))
+    info["spinful"] = requested_spin == "spinful"
+    info["orbits_quantity"] = int(selected["spatial_orbits_quantity"])
+    if args.fermi_energy_ev is not None:
+        info["fermi_energy_eV"] = float(args.fermi_energy_ev)
+    if "fermi_energy_eV" not in info:
+        info["fermi_energy_eV"] = 0.0
+
+    poscar_src = selected_overlap_dir / "POSCAR"
+    k_path_src = selected_ham_dir / "K_PATH"
+    if not k_path_src.is_file():
+        raise FileNotFoundError(f"Missing K_PATH beside hamiltonian.h5: {k_path_src}")
+
+    prepare_output_directory(out_dir, overwrite=args.overwrite)
+    shutil.copy2(poscar_src, out_dir / "POSCAR")
+    shutil.copy2(k_path_src, out_dir / "K_PATH")
+    materialize_file(selected_ham_dir / "hamiltonian.h5", out_dir / "hamiltonian.h5", args.link_mode)
+    materialize_file(selected_overlap_dir / "overlap.h5", out_dir / "overlap.h5", args.link_mode)
+    (out_dir / "info.json").write_text(json.dumps(info, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    ham_sig: MatrixSignature = choice["ham_signature"]
+    overlap_sig: MatrixSignature = choice["overlap_signature"]
+    manifest = {
+        "schema_version": "direct-overlap-band-prep/1",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "case_root": str(case_root),
+        "output_dir": str(out_dir),
+        "hamiltonian_source": str(selected_ham_dir),
+        "overlap_source": str(selected_overlap_dir),
+        "spin_mode": requested_spin,
+        "fermi_energy_eV": info.get("fermi_energy_eV"),
+        "link_mode": args.link_mode,
+        "validation": {
+            "per_element_spatial_orbitals": selected["per_element_spatial_orbitals"],
+            "spatial_orbits_quantity": selected["spatial_orbits_quantity"],
+            "matrix_orbits_quantity": selected["spatial_orbits_quantity"] * (2 if requested_spin == "spinful" else 1),
+            "hamiltonian_unique_shapes": ham_sig.unique_shapes,
+            "overlap_unique_shapes": overlap_sig.unique_shapes,
+            "hamiltonian_entries_dtype": ham_sig.entries_dtype,
+            "overlap_entries_dtype": overlap_sig.entries_dtype,
+            "atom_pairs": int(len(ham_sig.atom_pairs)),
+        },
+        "notes": [
+            "For spinful/SOC calc-band, hamiltonian.h5 is spinful but overlap.h5 stays spatial/spinless.",
+            "orbits_quantity remains the spatial-orbital count.",
+        ],
+        "next_commands": [
+            f"cd {out_dir}",
+            f"{args.dock_bin} compute eigen calc-band ./ --parallel-num {args.parallel_num} --thread-num {args.thread_num}",
+        ],
+    }
+    (out_dir / "band_prepare_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    print("\n已生成 / Prepared:")
+    print(f"  {out_dir}")
+    print("下一步 / Next:")
+    print(f"  cd {out_dir}")
+    print(f"  {args.dock_bin} compute eigen calc-band ./ --parallel-num {args.parallel_num} --thread-num {args.thread_num}")
+
+    if args.run_calc_band:
+        command = [
+            args.dock_bin,
+            "compute",
+            "eigen",
+            "calc-band",
+            "./",
+            "--parallel-num",
+            str(args.parallel_num),
+            "--thread-num",
+            str(args.thread_num),
+        ]
+        print("+ " + " ".join(command))
+        subprocess.run(command, cwd=str(out_dir), check=True)
 
 
 if __name__ == "__main__":
